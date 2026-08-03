@@ -13,11 +13,23 @@ import os
 from dataclasses import asdict
 
 import safetensors.torch
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from ..attacks import AttackResult
 from .database import log_config_to_db
 from .json_utils import CompactJSONEncoder
+
+
+def offload_checkpoint(result: AttackResult, run_dir: str) -> None:
+    """Persist any raw resume-checkpoint dict on the result to a sibling checkpoint.pt
+    file, replacing the in-memory dict with that file's path so it doesn't end up
+    inlined (and un-JSON-serializable) in run.json."""
+    for run in result.runs:
+        if isinstance(run.checkpoint, dict):
+            checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
+            torch.save(run.checkpoint, checkpoint_path)
+            run.checkpoint = checkpoint_path
 
 
 def offload_tensors(run_config, result: AttackResult, embed_dir: str):
@@ -58,7 +70,6 @@ def log_attack(run_config, result: AttackResult, cfg: DictConfig, date_time_stri
         }
         offload_tensors(subrun_config, subrun_result, embed_dir)
 
-        log_message.update(asdict(subrun_result))
         # Find and reserve the first available run_i directory atomically.
         i = 0
         log_dir = os.path.join(save_dir, date_time_string)
@@ -69,6 +80,9 @@ def log_attack(run_config, result: AttackResult, cfg: DictConfig, date_time_stri
                 break
             except FileExistsError:
                 i += 1
+        offload_checkpoint(subrun_result, run_dir)
+
+        log_message.update(asdict(subrun_result))
         log_file = os.path.join(run_dir, "run.json")
 
         os.makedirs(os.path.dirname(log_file), exist_ok=True)

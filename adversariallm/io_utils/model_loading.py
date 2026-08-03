@@ -76,7 +76,7 @@ def load_model_and_tokenizer(
             quantization_config=quantization_config,
         ).eval()
     else:
-        if "gemma-3" in model_params.id:
+        if "gemma-3" in model_params.id or "gemma-4" in model_params.id:
             model = AutoModelForCausalLM.from_pretrained(
                 model_params.id,
                 dtype=getattr(torch, model_params.dtype),
@@ -141,6 +141,9 @@ def load_model_and_tokenizer(
         case path if "gemma-2" in path:
             tokenizer.model_max_length = 8192
         case path if "gemma-3" in path:
+            # true ctx is 128k but we don't have that much memory
+            tokenizer.model_max_length = 32768
+        case path if "gemma-4" in path:
             # true ctx is 128k but we don't have that much memory
             tokenizer.model_max_length = 32768
         case path if "zephyr" in path:

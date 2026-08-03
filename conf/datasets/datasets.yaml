@@ -1,3 +1,10 @@
+guidedbench:
+  name: guidedbench
+  path: ${root_dir}/../GuidedBench/Dataset/GuidedBench.csv
+  seed: 0
+  idx: null
+  shuffle: false
+  multirun: false
 adv_behaviors:
   name: adv_behaviors
   messages_path: ${root_dir}/data/behavior_datasets/harmbench_behaviors_text_all.csv

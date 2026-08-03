@@ -14,7 +14,10 @@ This is quite different from the embedding-space attack, and the attack is less 
 """
 
 import functools
+import json
 import logging
+import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -65,6 +68,14 @@ class PGDConfig:
     random_restart_interval: int = 0
     random_restart_epsilon: float = 0.1
     log_embeddings: bool = False
+    # List of prior run directories (each containing run.json + checkpoint.pt) to
+    # resume from, one per conversation in this run's dataset idx, in the same
+    # order. All of them must come from the same original batched attack_batch()
+    # call (same RNG state, same prior step count) - resuming a mix of runs that
+    # weren't originally optimized together in lockstep is not supported. num_steps
+    # additional steps are run on top of the prior ones; the resulting run.json per
+    # conversation contains the full (prior + new) step history.
+    resume_from: Optional[list[str]] = None
 
 
 class PGDAttack(Attack):
@@ -193,6 +204,73 @@ class PGDAttack(Attack):
 
         return tokens, attack_mask.long(), target_mask.long(), attack_conversation
 
+    def _load_resume_state(self, resume_from: str) -> tuple[list[AttackStepResult], float, dict]:
+        """Load a prior run's logged steps and its resume checkpoint (perturbed
+        embeddings/one-hot, optimizer state, RNG state) from `resume_from` (the
+        run_dir containing run.json + checkpoint.pt)."""
+        with open(os.path.join(resume_from, "run.json")) as f:
+            prior_log = json.load(f)
+        prior_run = prior_log["runs"][0]
+        prior_steps = [AttackStepResult(**step) for step in prior_run["steps"]]
+        prior_total_time = prior_run.get("total_time", 0.0)
+        checkpoint = torch.load(os.path.join(resume_from, "checkpoint.pt"), map_location="cpu")
+        return prior_steps, prior_total_time, checkpoint
+
+    def _apply_resume_state(self, optimizer, checkpoint: dict) -> None:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        torch.set_rng_state(checkpoint["rng_state"]["torch"])
+        if checkpoint["rng_state"]["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(checkpoint["rng_state"]["torch_cuda"])
+        random.setstate(checkpoint["rng_state"]["python"])
+
+    def _merge_resume_checkpoints(self, checkpoints: list[dict]) -> dict:
+        """Combine B per-conversation checkpoints (as saved by a single prior batched
+        attack_batch() call) back into one batch-shaped checkpoint. Only valid if all
+        of them came from the *same* prior run, since RNG state and step count must
+        agree across the whole batch for a shared, in-lockstep continuation to make
+        sense; asserts that here rather than silently producing an inexact resume."""
+        rng_states = [c["rng_state"] for c in checkpoints]
+        assert all(
+            torch.equal(r["torch"], rng_states[0]["torch"]) for r in rng_states
+        ), "resume_from entries have mismatched RNG state - they must all come from the same original batched run."
+
+        merged_state = {}
+        for param_idx in checkpoints[0]["optimizer_state"]["state"]:
+            merged_state[param_idx] = {}
+            for key in checkpoints[0]["optimizer_state"]["state"][param_idx]:
+                values = [c["optimizer_state"]["state"][param_idx][key] for c in checkpoints]
+                if isinstance(values[0], torch.Tensor) and values[0].dim() > 0:
+                    merged_state[param_idx][key] = torch.cat(values, dim=0)
+                else:
+                    merged_state[param_idx][key] = values[0]
+
+        return {
+            "perturbed_embeddings_or_one_hot": torch.stack(
+                [c["perturbed_embeddings_or_one_hot"] for c in checkpoints], dim=0
+            ),
+            "optimizer_state": {
+                "state": merged_state,
+                "param_groups": checkpoints[0]["optimizer_state"]["param_groups"],
+            },
+            "rng_state": rng_states[0],
+        }
+
+    @staticmethod
+    def _slice_optimizer_state(optimizer, i: int) -> dict:
+        """Return optimizer.state_dict() with any per-parameter batched tensors (e.g.
+        Adam's exp_avg/exp_avg_sq) sliced down to conversation i, keeping a leading
+        batch dim of 1 so it matches a single-conversation resume. No-op for
+        optimizers like FGSMOptimizer that keep no per-param state."""
+        state_dict = optimizer.state_dict()
+        sliced_state = {
+            param_idx: {
+                k: (v[i:i + 1].clone() if isinstance(v, torch.Tensor) and v.dim() > 0 else v)
+                for k, v in param_state.items()
+            }
+            for param_idx, param_state in state_dict["state"].items()
+        }
+        return {"state": sliced_state, "param_groups": state_dict["param_groups"]}
+
     def attack_batch(
         self,
         model: PreTrainedModel,
@@ -209,6 +287,29 @@ class PGDAttack(Attack):
         device = model.device
         B, L = x_batch.shape
         disallowed_ids = get_disallowed_ids(tokenizer, allow_non_ascii=False, allow_special=False)
+
+        prior_steps_per_conv: list[list[AttackStepResult]] = [[] for _ in range(B)]
+        prior_total_time_per_conv: list[float] = [0.0] * B
+        resume_checkpoint = None
+        if self.config.resume_from:
+            resume_paths = list(self.config.resume_from)
+            assert len(resume_paths) == B, (
+                f"resume_from has {len(resume_paths)} entries but this batch has {B} conversations - "
+                "pass one run_dir per conversation, in the same order as dataset idx."
+            )
+            checkpoints = []
+            for i, path in enumerate(resume_paths):
+                steps_i, total_time_i, checkpoint_i = self._load_resume_state(path)
+                prior_steps_per_conv[i] = steps_i
+                prior_total_time_per_conv[i] = total_time_i
+                checkpoints.append(checkpoint_i)
+            step_offsets = [len(s) for s in prior_steps_per_conv]
+            assert len(set(step_offsets)) == 1, (
+                f"resume_from entries have differing prior step counts {step_offsets} - "
+                "they must all come from the same original batched run."
+            )
+            resume_checkpoint = self._merge_resume_checkpoints(checkpoints)
+        step_offset = len(prior_steps_per_conv[0])
 
         x_batch = x_batch.to(device)
         y_batch = y_batch.to(device)
@@ -232,6 +333,9 @@ class PGDAttack(Attack):
         if self.zero_init_attack:
             perturbed_embeddings_or_one_hot[attack_masks_batch] = 0
 
+        if resume_checkpoint is not None:
+            perturbed_embeddings_or_one_hot = resume_checkpoint["perturbed_embeddings_or_one_hot"].to(device)
+
         benign_ref_data = None
         if self.config.tie_logits > 0 or self.config.tie_features > 0:
              benign_ref_data = self._setup_benign_reference(model, tokenizer, B, device)
@@ -244,6 +348,8 @@ class PGDAttack(Attack):
         pbar = trange(self.config.num_steps, desc=f"Running PGD Attack Loop on {B} conversations", file=sys.stdout)
         perturbed_embeddings_or_one_hot.requires_grad = True
         optimizer = self._initialize_optimizer([perturbed_embeddings_or_one_hot])
+        if resume_checkpoint is not None:
+            self._apply_resume_state(optimizer, resume_checkpoint)
 
         for step in pbar:
             t0 = time.time()
@@ -289,57 +395,80 @@ class PGDAttack(Attack):
                 pert_emb_cpu = self._select_embeddings_for_generation(perturbed_embeddings_or_one_hot[i], target_masks_batch[i])
                 batch_perturbed_embeddings_list[i].append(pert_emb_cpu)
 
-        # Generation after all steps
-        final_perturbed_embeddings_flat = []
-        # We need the embeddings corresponding to the *input* for generation, not just attack tokens
-        # Assuming the generation should start after the prompt+attack string
-        for i in range(B):
-             # Find the last index of the non-target part (pre+attack+prompt+post)
-             end_of_input_idx = torch.where(~target_masks_batch[i].roll(1,0))[0][-1].item()
-             for step in range(self.config.num_steps):
-                input_embeds_or_one_hot = batch_perturbed_embeddings_list[i][step][:end_of_input_idx + 1]
-                input_embeds = self._maybe_convert_to_embeddings(input_embeds_or_one_hot.to(model.device), model).cpu()
-                final_perturbed_embeddings_flat.append(input_embeds.cpu())
+        # Resolve per-step sample counts
+        if self.config.generation_config.sampling_schedule is not None:
+            schedule = self.config.generation_config.sampling_schedule[:self.config.num_steps]
+        else:
+            schedule = [self.config.generation_config.num_return_sequences] * self.config.num_steps
 
-        # Generate based on the *final* perturbation state for each item in the batch
-        logging.info(f"Attacks done, generating completions...")
-        outputs = generate_ragged_batched(
-            model,
-            tokenizer,
-            embedding_list=final_perturbed_embeddings_flat,
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=self.config.generation_config.num_return_sequences,
-        )
-        logging.info(f"Generated {len(outputs)}x{self.config.generation_config.num_return_sequences} completions")
+        # Pre-compute end-of-input index for each conversation
+        end_indices = [
+            torch.where(~target_masks_batch[i].roll(1, 0))[0][-1].item()
+            for i in range(B)
+        ]
+
+        # Group (conv_i, step) pairs by sample count, building embeddings on the fly
+        groups: dict[int, list[tuple[int, int, torch.Tensor]]] = {}
+        for i in range(B):
+            for step in range(self.config.num_steps):
+                n = schedule[step]
+                if n > 0:
+                    raw = batch_perturbed_embeddings_list[i][step][:end_indices[i] + 1]
+                    emb = self._maybe_convert_to_embeddings(raw.to(model.device), model).cpu()
+                    groups.setdefault(n, []).append((i, step, emb))
+
+        logging.info("Attacks done, generating completions...")
+        completions: list[list[list[str]]] = [[[] for _ in range(self.config.num_steps)] for _ in range(B)]
+        for n_seqs, entries in groups.items():
+            group_outputs = generate_ragged_batched(
+                model,
+                tokenizer,
+                embedding_list=[emb for _, _, emb in entries],
+                max_new_tokens=self.config.generation_config.max_new_tokens,
+                temperature=self.config.generation_config.temperature,
+                top_p=self.config.generation_config.top_p,
+                top_k=self.config.generation_config.top_k,
+                num_return_sequences=n_seqs,
+            )
+            for (conv_i, step, _), step_completions in zip(entries, group_outputs):
+                completions[conv_i][step] = step_completions
+        logging.info(f"Generated completions for {sum(len(e) for e in groups.values())} step(s)")
 
         # Structure results
         t_end = time.time()
+        rng_state = {
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python": random.getstate(),
+        }
         runs = []
         for i in range(B):
-             # Create step results, but only the last one has meaningful completions here
-             steps = []
-             for step in range(self.config.num_steps):
+            steps = []
+            for step in range(self.config.num_steps):
                 if self.config.log_embeddings:
-                     model_input_embeddings = batch_perturbed_embeddings_list[i][step].cpu()
+                    model_input_embeddings = batch_perturbed_embeddings_list[i][step].cpu()
                 else:
                     model_input_embeddings = None
                 steps.append(AttackStepResult(
-                     step=step,
-                     model_completions=outputs[i * self.config.num_steps + step],
-                     time_taken=batch_times[i][step],
-                     loss=batch_losses[i][step],
-                     model_input_embeddings=model_input_embeddings,
-                     model_input=original_conversations_batch[i],
-                 ))
-             input_conversation = original_conversations_batch[i]
-             runs.append(SingleAttackRunResult(
-                 original_prompt=input_conversation,
-                 steps=steps,
-                 total_time=(t_end - t_start) / B
-             ))
+                    step=step + step_offset,
+                    model_completions=completions[i][step],
+                    time_taken=batch_times[i][step],
+                    loss=batch_losses[i][step],
+                    model_input_embeddings=model_input_embeddings,
+                    model_input=original_conversations_batch[i],
+                ))
+            input_conversation = original_conversations_batch[i]
+            checkpoint_data = {
+                "perturbed_embeddings_or_one_hot": perturbed_embeddings_or_one_hot[i].detach().cpu(),
+                "optimizer_state": self._slice_optimizer_state(optimizer, i),
+                "rng_state": rng_state,
+            }
+            runs.append(SingleAttackRunResult(
+                original_prompt=input_conversation,
+                steps=prior_steps_per_conv[i] + steps,
+                total_time=prior_total_time_per_conv[i] + (t_end - t_start) / B,
+                checkpoint=checkpoint_data,
+            ))
         return runs
 
     def _maybe_convert_to_embeddings(self, embeddings_or_one_hot, model):

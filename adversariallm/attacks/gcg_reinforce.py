@@ -12,11 +12,15 @@ to provide rewards for generated completions and optimizes using REINFORCE gradi
 """
 
 import gc
+import json
 import logging
+import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Optional
 
 from judgezoo import Judge
 import torch
@@ -82,6 +86,10 @@ class GCGReinforceConfig:
     optim_num_return_sequences_for_grad: int = 0
     harmful_threshold: float = 0.5  # for exploit_greedy
     entropy_losses_weight: float = 0.0
+    # Path to a previous run's directory (containing run.json + checkpoint.pt) to
+    # resume from. num_steps additional steps are run on top of the prior ones;
+    # the resulting run.json contains the full (prior + new) step history.
+    resume_from: Optional[str] = None
 
 
 class GCGReinforceAttack(Attack[GCGReinforceConfig]):
@@ -134,10 +142,51 @@ class GCGReinforceAttack(Attack[GCGReinforceConfig]):
             )
         return AttackResult(runs=runs)
 
+    def _load_resume_state(self, resume_from: str) -> tuple[list[AttackStepResult], float, dict]:
+        """Load a prior run's logged steps and its resume checkpoint (elite buffer,
+        exploit-greedy tracking, reward cache, RNG state, etc.) from `resume_from`
+        (the run_dir containing run.json + checkpoint.pt)."""
+        with open(os.path.join(resume_from, "run.json")) as f:
+            prior_log = json.load(f)
+        prior_run = prior_log["runs"][0]
+        prior_steps = [AttackStepResult(**step) for step in prior_run["steps"]]
+        prior_total_time = prior_run.get("total_time", 0.0)
+        checkpoint = torch.load(os.path.join(resume_from, "checkpoint.pt"), map_location="cpu")
+        return prior_steps, prior_total_time, checkpoint
+
+    def _apply_resume_state(self, checkpoint: dict, device) -> Tensor:
+        self.elite_buffer = [(gen.to(device), reward) for gen, reward in checkpoint["elite_buffer"]]
+        self.previous_greedy_reward = checkpoint["previous_greedy_reward"]
+        self.previous_optim_ids = (
+            checkpoint["previous_optim_ids"].to(device) if checkpoint["previous_optim_ids"] is not None else None
+        )
+        self.previous_rewards = (
+            checkpoint["previous_rewards"].to(device) if checkpoint["previous_rewards"] is not None else None
+        )
+        self.previous_generations = (
+            [g.to(device) for g in checkpoint["previous_generations"]]
+            if checkpoint["previous_generations"] is not None
+            else None
+        )
+        self.previous_categories = checkpoint["previous_categories"]
+        self.reward_cache = checkpoint["reward_cache"]
+        torch.set_rng_state(checkpoint["rng_state"]["torch"])
+        if checkpoint["rng_state"]["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(checkpoint["rng_state"]["torch_cuda"])
+        random.setstate(checkpoint["rng_state"]["python"])
+        return checkpoint["optim_ids"].to(device)
+
     def _attack_single_conversation(
         self, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, conversation: Conversation
     ) -> SingleAttackRunResult:
         t0 = time.time()
+        prior_steps: list[AttackStepResult] = []
+        prior_total_time = 0.0
+        resume_checkpoint = None
+        if self.config.resume_from:
+            prior_steps, prior_total_time, resume_checkpoint = self._load_resume_state(self.config.resume_from)
+        step_offset = len(prior_steps)
+
         pre_prompt_ids, attack_suffix_ids, post_ids, target_ids = self._tokenize_conversation(conversation)
 
         # Embed everything that doesn't get optimized
@@ -151,8 +200,10 @@ class GCGReinforceAttack(Attack[GCGReinforceConfig]):
         self.post_embeds = post_embeds
         self.target_embeds = target_embeds
 
-        # Initialize the attack buffer
+        # Initialize the attack buffer (overridden below when resuming)
         optim_ids = attack_suffix_ids
+        if resume_checkpoint is not None:
+            optim_ids = self._apply_resume_state(resume_checkpoint, model.device)
 
         rewards = []
         times = []
@@ -191,24 +242,39 @@ class GCGReinforceAttack(Attack[GCGReinforceConfig]):
             token_list.append(torch.cat(tokens[:5]))
             attack_conversations.append(attack_conversation)
 
-        batch_completions = generate_ragged_batched(
-            model,
-            tokenizer,
-            token_list=token_list,
-            initial_batch_size=len(token_list),
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=self.config.generation_config.num_return_sequences,
-        )  # (N_steps, N_return_sequences, T)
+        actual_steps = len(optim_strings)
+        if self.config.generation_config.sampling_schedule is not None:
+            schedule = self.config.generation_config.sampling_schedule[:actual_steps]
+        else:
+            schedule = [self.config.generation_config.num_return_sequences] * actual_steps
+
+        groups: dict[int, list[int]] = {}
+        for i, n in enumerate(schedule):
+            if n > 0:
+                groups.setdefault(n, []).append(i)
+
+        completions: list[list[str]] = [[] for _ in range(actual_steps)]
+        for n_seqs, step_indices in groups.items():
+            group_completions = generate_ragged_batched(
+                model,
+                tokenizer,
+                token_list=[token_list[i] for i in step_indices],
+                initial_batch_size=len(step_indices),
+                max_new_tokens=self.config.generation_config.max_new_tokens,
+                temperature=self.config.generation_config.temperature,
+                top_p=self.config.generation_config.top_p,
+                top_k=self.config.generation_config.top_k,
+                num_return_sequences=n_seqs,
+            )
+            for step_idx, step_completions in zip(step_indices, group_completions):
+                completions[step_idx] = step_completions
 
         steps = []
         t1 = time.time()
-        for i in range(len(optim_strings)):
+        for i in range(actual_steps):
             step = AttackStepResult(
-                step=i,
-                model_completions=batch_completions[i],
+                step=i + step_offset,
+                model_completions=completions[i],
                 time_taken=times[i],
                 loss=losses[i],
                 flops=flops[i],
@@ -217,10 +283,31 @@ class GCGReinforceAttack(Attack[GCGReinforceConfig]):
             )
             steps.append(step)
 
+        checkpoint_data = {
+            "optim_ids": optim_ids.detach().cpu(),
+            "elite_buffer": [(gen.detach().cpu(), reward) for gen, reward in self.elite_buffer],
+            "previous_greedy_reward": self.previous_greedy_reward,
+            "previous_optim_ids": self.previous_optim_ids.detach().cpu() if self.previous_optim_ids is not None else None,
+            "previous_rewards": self.previous_rewards.detach().cpu() if self.previous_rewards is not None else None,
+            "previous_generations": (
+                [g.detach().cpu() for g in self.previous_generations]
+                if self.previous_generations is not None
+                else None
+            ),
+            "previous_categories": self.previous_categories,
+            "reward_cache": self.reward_cache,
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "python": random.getstate(),
+            },
+        }
+
         run = SingleAttackRunResult(
             original_prompt=conversation,
-            steps=steps,
-            total_time=t1 - t0,
+            steps=prior_steps + steps,
+            total_time=prior_total_time + (t1 - t0),
+            checkpoint=checkpoint_data,
         )
         return run
 

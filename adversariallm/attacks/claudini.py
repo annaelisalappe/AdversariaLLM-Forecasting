@@ -23,7 +23,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -83,9 +83,10 @@ class ClaudiniConfig:
     seed: int = 0
     num_steps: int = 250
     n_tokens_adv: int = 20
-    # Optional completion-count override for the final optimization step only.
-    # If None, all steps use generation_config.num_return_sequences.
-    last_step_num_return_sequences: int | None = None
+    # Replaced by sampling_schedule below, which generalises this to all steps:
+    # last_step_num_return_sequences: int | None = None
+    # Moved to GenerationConfig.sampling_schedule:
+    # sampling_schedule: Optional[list[int]] = None
     init_mode: Literal["manual", "random_allowed"] = "manual"
     optim_str_init: str = "! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !"
 
@@ -487,7 +488,13 @@ class ClaudiniAttack(Attack):
             device=model.device,
         )
 
-        completions = self._generate_step_completions(model, tokenizer, token_prompts)
+        actual_steps = len(step_suffix_ids)
+        schedule = (
+            self.config.generation_config.sampling_schedule[:actual_steps]
+            if self.config.generation_config.sampling_schedule is not None
+            else [self.config.generation_config.num_return_sequences] * actual_steps
+        )
+        completions = self._generate_step_completions(model, tokenizer, token_prompts, schedule)
 
         steps: list[AttackStepResult] = []
         for idx in range(len(step_suffix_ids)):
@@ -536,53 +543,71 @@ class ClaudiniAttack(Attack):
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         token_prompts: list[torch.Tensor],
+        schedule: list[int],
     ) -> list[list[str]]:
-        base_n = self.config.generation_config.num_return_sequences
-        last_n = self.config.last_step_num_return_sequences
-        if last_n is None:
-            last_n = base_n
+        # Old implementation used last_step_num_return_sequences for a two-branch
+        # strategy (uniform baseline + optional final-step override). Replaced by
+        # the generalised per-step schedule below.
+        #
+        # base_n = self.config.generation_config.num_return_sequences
+        # last_n = self.config.last_step_num_return_sequences
+        # if last_n is None:
+        #     last_n = base_n
+        # if last_n <= 0:
+        #     raise ValueError("last_step_num_return_sequences must be > 0 when set")
+        # if len(token_prompts) <= 1 or last_n == base_n:
+        #     return generate_ragged_batched(
+        #         model, tokenizer, token_list=token_prompts,
+        #         max_new_tokens=self.config.generation_config.max_new_tokens,
+        #         temperature=self.config.generation_config.temperature,
+        #         top_p=self.config.generation_config.top_p,
+        #         top_k=self.config.generation_config.top_k,
+        #         num_return_sequences=base_n,
+        #         initial_batch_size=len(token_prompts),
+        #     )
+        # prefix = generate_ragged_batched(
+        #     model, tokenizer, token_list=token_prompts[:-1],
+        #     max_new_tokens=self.config.generation_config.max_new_tokens,
+        #     temperature=self.config.generation_config.temperature,
+        #     top_p=self.config.generation_config.top_p,
+        #     top_k=self.config.generation_config.top_k,
+        #     num_return_sequences=base_n,
+        #     initial_batch_size=len(token_prompts) - 1,
+        # )
+        # last = generate_ragged_batched(
+        #     model, tokenizer, token_list=[token_prompts[-1]],
+        #     max_new_tokens=self.config.generation_config.max_new_tokens,
+        #     temperature=self.config.generation_config.temperature,
+        #     top_p=self.config.generation_config.top_p,
+        #     top_k=self.config.generation_config.top_k,
+        #     num_return_sequences=last_n,
+        #     initial_batch_size=1,
+        # )
+        # return prefix + last
 
-        if last_n <= 0:
-            raise ValueError("last_step_num_return_sequences must be > 0 when set")
+        # Group step indices by their non-zero sample count for batched generation
+        groups: dict[int, list[int]] = {}
+        for i, n in enumerate(schedule):
+            if n > 0:
+                groups.setdefault(n, []).append(i)
 
-        if len(token_prompts) <= 1 or last_n == base_n:
-            return generate_ragged_batched(
+        completions: list[list[str]] = [[] for _ in range(len(token_prompts))]
+        for n_seqs, step_indices in groups.items():
+            group_tokens = [token_prompts[i] for i in step_indices]
+            group_completions = generate_ragged_batched(
                 model,
                 tokenizer,
-                token_list=token_prompts,
+                token_list=group_tokens,
+                initial_batch_size=len(group_tokens),
                 max_new_tokens=self.config.generation_config.max_new_tokens,
                 temperature=self.config.generation_config.temperature,
                 top_p=self.config.generation_config.top_p,
                 top_k=self.config.generation_config.top_k,
-                num_return_sequences=base_n,
-                initial_batch_size=len(token_prompts),
+                num_return_sequences=n_seqs,
             )
-
-        # Generate all non-final steps with the baseline return count,
-        # then oversample only the final step.
-        prefix = generate_ragged_batched(
-            model,
-            tokenizer,
-            token_list=token_prompts[:-1],
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=base_n,
-            initial_batch_size=len(token_prompts) - 1,
-        )
-        last = generate_ragged_batched(
-            model,
-            tokenizer,
-            token_list=[token_prompts[-1]],
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=last_n,
-            initial_batch_size=1,
-        )
-        return prefix + last
+            for step_idx, step_completions in zip(step_indices, group_completions):
+                completions[step_idx] = step_completions
+        return completions
 
     def _dpto_sample(
         self,
@@ -751,7 +776,13 @@ class ClaudiniAttack(Attack):
             device=model.device,
         )
 
-        completions = self._generate_step_completions(model, tokenizer, token_prompts)
+        actual_steps = len(step_suffix_ids)
+        schedule = (
+            self.config.generation_config.sampling_schedule[:actual_steps]
+            if self.config.generation_config.sampling_schedule is not None
+            else [self.config.generation_config.num_return_sequences] * actual_steps
+        )
+        completions = self._generate_step_completions(model, tokenizer, token_prompts, schedule)
 
         steps: list[AttackStepResult] = []
         for idx in range(len(step_suffix_ids)):

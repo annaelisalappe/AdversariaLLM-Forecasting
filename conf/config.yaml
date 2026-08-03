@@ -9,15 +9,15 @@ defaults:
 
 hydra:
   run:
-    dir: ${root_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
+    dir: ${output_root}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
   job:
     chdir: true
   sweep:
-    dir: ${root_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
+    dir: ${output_root}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}/
 
 name: testing
-save_dir: ${root_dir}/outputs/  # place to store results
-embed_dir: ${root_dir}/embeddings/  # place to store embeddings for emebdding attacks
+save_dir: ${output_root}/outputs/  # place to store results
+embed_dir: ${output_root}/embeddings/  # place to store embeddings for emebdding attacks
 overwrite: false
 
 classifiers: ["strong_reject"]  # anything from judgezoo
@@ -29,6 +29,7 @@ generation_config:
   top_k: 0
   max_new_tokens: 256
   num_return_sequences: 1
+  sampling_schedule: null
 
 # overrides for parallelism
 attack: null

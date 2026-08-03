@@ -1,3 +1,4 @@
+import copy
 import os
 from datetime import datetime
 
@@ -57,14 +58,25 @@ def collect_configs(cfg: DictConfig) -> list[RunConfig]:
                         None if defense == "none" else defense_params,
                     )
                     run_config = filter_config(run_config, dset_len, overwrite=cfg.overwrite)
-                    if run_config is not None:
-                        all_run_configs.append(run_config)
+                    if run_config is None:
+                        continue
+                    if run_config.dataset_params.get("multirun", False) and isinstance(run_config.dataset_params.idx, (list, ListConfig)):
+                        # Launch each behaviour as its own run so results are logged (and
+                        # skippable on re-run via filter_config) as soon as it finishes,
+                        # instead of only after the whole idx list completes.
+                        for single_idx in run_config.dataset_params.idx:
+                            single_run_config = copy.deepcopy(run_config)
+                            single_run_config.dataset_params.idx = [single_idx]
+                            all_run_configs.append(single_run_config)
+                    else:
+                            all_run_configs.append(run_config)
     return all_run_configs
 
 
 def run_attacks(all_run_configs: list[RunConfig], cfg: DictConfig, date_time_string: str) -> None:
     last_model = None
     last_dataset = None
+    last_dataset_params = None
     last_attack = None
     last_defense = None
     for run_config in all_run_configs:
@@ -74,9 +86,10 @@ def run_attacks(all_run_configs: list[RunConfig], cfg: DictConfig, date_time_str
             logging.info(f"Target: {run_config.model}\n{OmegaConf.to_yaml(run_config.model_params, resolve=True)}")
             last_model = run_config.model
             model, tokenizer = load_model_and_tokenizer(run_config.model_params)
-        if last_dataset != run_config.dataset:
+        if last_dataset != run_config.dataset or last_dataset_params != run_config.dataset_params:
             logging.info(f"Dataset: {run_config.dataset}\n{OmegaConf.to_yaml(run_config.dataset_params, resolve=True)}")
             last_dataset = run_config.dataset
+            last_dataset_params = run_config.dataset_params
             dataset = PromptDataset.from_name(run_config.dataset)(run_config.dataset_params)
         if last_attack != run_config.attack:
             logging.info(f"Attack: {run_config.attack}\n{OmegaConf.to_yaml(run_config.attack_params, resolve=True)}")

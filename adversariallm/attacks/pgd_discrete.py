@@ -619,20 +619,34 @@ class PGDDiscreteAttack(Attack):
                 self._plot_metrics(mean_losses_hist, mean_losses_one_hot_hist, mean_diffs_hist, mean_diffs_one_hot_hist, learning_rates_hist)
 
         # --- Generation ---
-        # Use the stored discrete embeddings from each step
-        flattened_embeddings = [e for el in batch_perturbed_embeddings_list for e in el]
-        outputs = generate_ragged_batched(
-            model,
-            tokenizer,
-            embedding_list=flattened_embeddings,
-            initial_batch_size=512,
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=self.config.generation_config.num_return_sequences,
-        )
-        logging.info(f"Generated {len(outputs)}x{self.config.generation_config.num_return_sequences} completions")
+        if self.config.generation_config.sampling_schedule is not None:
+            schedule = self.config.generation_config.sampling_schedule[:self.config.num_steps]
+        else:
+            schedule = [self.config.generation_config.num_return_sequences] * self.config.num_steps
+
+        groups: dict[int, list[tuple[int, int]]] = {}
+        for i in range(B):
+            for step_idx in range(self.config.num_steps):
+                n = schedule[step_idx]
+                if n > 0:
+                    groups.setdefault(n, []).append((i, step_idx))
+
+        completions: list[list[list[str]]] = [[[] for _ in range(self.config.num_steps)] for _ in range(B)]
+        for n_seqs, pairs in groups.items():
+            group_outputs = generate_ragged_batched(
+                model,
+                tokenizer,
+                embedding_list=[batch_perturbed_embeddings_list[i][step] for i, step in pairs],
+                initial_batch_size=512,
+                max_new_tokens=self.config.generation_config.max_new_tokens,
+                temperature=self.config.generation_config.temperature,
+                top_p=self.config.generation_config.top_p,
+                top_k=self.config.generation_config.top_k,
+                num_return_sequences=n_seqs,
+            )
+            for (conv_i, step_idx), step_completions in zip(pairs, group_outputs):
+                completions[conv_i][step_idx] = step_completions
+        logging.info(f"Generated completions for {sum(len(p) for p in groups.values())} step(s)")
 
         # --- Result Formatting ---
         t_end_batch = time.time()
@@ -640,9 +654,6 @@ class PGDDiscreteAttack(Attack):
         for i in range(B):
             steps = []
             for step_idx in range(self.config.num_steps):
-                # Calculate the index in the flattened outputs list
-                output_idx = i * self.config.num_steps + step_idx
-                # Reconstruct the attack conversation for this step
                 attack_conversation = self._reconstruct_attack_conversation(
                     original_conversations_batch[i],
                     batch_discrete_tokens[i][step_idx],
@@ -650,16 +661,16 @@ class PGDDiscreteAttack(Attack):
                 )
                 steps.append(PGDAttackStepResult(
                     step=step_idx,
-                    model_completions=outputs[output_idx],
+                    model_completions=completions[i][step_idx],
                     time_taken=batch_times[i][step_idx],
-                    loss=batch_losses_one_hot[i][step_idx], # Discrete loss
-                    continuous_loss=batch_losses[i][step_idx], # Continuous loss
+                    loss=batch_losses_one_hot[i][step_idx],
+                    continuous_loss=batch_losses[i][step_idx],
                     model_input=attack_conversation,
                 ))
             runs.append(SingleAttackRunResult(
                 original_prompt=original_conversations_batch[i],
                 steps=steps,
-                total_time=(t_end_batch - t_start_batch) # Total time for this batch
+                total_time=(t_end_batch - t_start_batch)
             ))
         return runs
 

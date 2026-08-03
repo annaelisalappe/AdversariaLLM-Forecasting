@@ -22,6 +22,10 @@ class GenerationConfig:
     top_p: float = 1.0
     top_k: int = 0
     num_return_sequences: int = 1
+    # Per-step sample counts. sampling_schedule[i] is the number of completions to
+    # generate after step i (0 = no generation for that step). When None, falls back
+    # to num_return_sequences for every step.
+    sampling_schedule: Optional[list[int]] = None
 
 
 @beartype
@@ -80,6 +84,12 @@ class SingleAttackRunResult:
 
     # Total time taken for this entire attack run on a **single instance**
     total_time: float = 0.0
+
+    # Optimizer-internal state needed to exactly resume this run later (e.g. buffer
+    # contents, RNG state). Only populated by attacks that support resuming (currently
+    # GCG). Holds the raw state dict until log_attack() offloads it to a sibling
+    # checkpoint.pt file, after which this holds that file's path instead.
+    checkpoint: Optional[Union[dict, str]] = None
 
 
 @beartype

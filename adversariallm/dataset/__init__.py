@@ -1,5 +1,6 @@
 from .adv_behaviors import AdvBehaviorsConfig, AdvBehaviorsDataset
 from .alpaca import AlpacaConfig, AlpacaDataset
+from .guidedbench import GuidedBenchConfig, GuidedBenchDataset
 from .jbb_behaviors import JBBBehaviorsConfig, JBBBehaviorsDataset
 from .mmlu import MMLUConfig, MMLUDataset
 from .or_bench import ORBenchConfig, ORBenchDataset
@@ -12,6 +13,8 @@ __all__ = [
     "PromptDataset",
     "AdvBehaviorsConfig",
     "AdvBehaviorsDataset",
+    "GuidedBenchConfig",
+    "GuidedBenchDataset",
     "MMLUConfig",
     "MMLUDataset",
     "RefusalDirectionDataConfig",

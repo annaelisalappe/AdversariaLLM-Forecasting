@@ -3,3 +3,9 @@
 #   python run_attacks.py root_dir=/absolute/path/to/repo ...
 # If you prefer, you can also hard-code your repository path here.
 root_dir: ${oc.env:PWD}
+
+# Where run outputs/multirun logs/embeddings get written. Separate from root_dir
+# (which stays pointed at the repo checkout, since it's also used to locate
+# dataset files) so storage-heavy run artifacts can live elsewhere, e.g. on a
+# less space-constrained filesystem.
+output_root: /ceph/hdd/shared/llm_attacks/lapan

@@ -26,8 +26,10 @@ The implementation is inspired by nanoGCG, but fixes several issues in nanoGCG,
 mostly related to tokenization.
 """
 import gc
+import json
 import logging
 import math
+import os
 import random
 import string
 import sys
@@ -57,6 +59,8 @@ class GCGConfig:
     version: str = ""
     placement: str = "suffix"
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
+    # Moved to GenerationConfig.sampling_schedule:
+    # sampling_schedule: Optional[list[int]] = None
     num_steps: int = 250
     seed: int = 0
     optim_str_init: str = "x x x x x x x x x x x x x x x x x x x x"
@@ -77,6 +81,10 @@ class GCGConfig:
     grow_target: bool = False
     grad_smoothing: int = 1  # 1 = no smoothing, 2 = smooth over 2 tokens, etc.
     grad_momentum: float = 0.0  # momentum over steps
+    # Path to a previous run's directory (containing run.json + checkpoint.pt) to
+    # resume from. num_steps additional steps are run on top of the prior ones;
+    # the resulting run.json contains the full (prior + new) step history.
+    resume_from: Optional[str] = None
 
 
 def compute_loss(shift_logits: Tensor, shift_labels: Tensor, loss_type: str, disallowed_ids: Tensor, mellowmax_alpha: float = 1.0, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> Tensor:
@@ -280,8 +288,35 @@ class GCGAttack(Attack):
             runs.append(self._attack_single_conversation(model, tokenizer, conversation))
         return AttackResult(runs=runs)
 
+    def _load_resume_state(self, resume_from: str) -> tuple[list[AttackStepResult], float, dict]:
+        """Load a prior run's logged steps and its resume checkpoint (buffer, RNG
+        state, etc.) from `resume_from` (the run_dir containing run.json + checkpoint.pt)."""
+        with open(os.path.join(resume_from, "run.json")) as f:
+            prior_log = json.load(f)
+        prior_run = prior_log["runs"][0]
+        prior_steps = [AttackStepResult(**step) for step in prior_run["steps"]]
+        prior_total_time = prior_run.get("total_time", 0.0)
+        checkpoint = torch.load(os.path.join(resume_from, "checkpoint.pt"), map_location="cpu")
+        return prior_steps, prior_total_time, checkpoint
+
+    def _apply_resume_state(self, buffer, token_selection, checkpoint, device) -> None:
+        buffer.buffer = [(loss, ids.to(device)) for loss, ids in checkpoint["buffer"]]
+        if checkpoint.get("grad_buffer") is not None:
+            token_selection.grad_buffer = checkpoint["grad_buffer"].to(device)
+        self.target_length = checkpoint["target_length"]
+        torch.set_rng_state(checkpoint["rng_state"]["torch"])
+        if checkpoint["rng_state"]["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(checkpoint["rng_state"]["torch_cuda"])
+        random.setstate(checkpoint["rng_state"]["python"])
+
     def _attack_single_conversation(self, model, tokenizer, conversation) -> SingleAttackRunResult:
         t0 = time.time()
+        prior_steps: list[AttackStepResult] = []
+        prior_total_time = 0.0
+        resume_checkpoint = None
+        if self.config.resume_from:
+            prior_steps, prior_total_time, resume_checkpoint = self._load_resume_state(self.config.resume_from)
+        step_offset = len(prior_steps)
         try:
             attack_conversation = [
                 {"role": "user", "content": conversation[0]["content"] + self.config.optim_str_init},
@@ -328,9 +363,12 @@ class GCGAttack(Attack):
             self.target_length = 1
         else:
             self.target_length = target_ids.size(1)
-        # Initialize the attack buffer
-        buffer, flops_init = self.init_buffer(model, attack_ids)
-        optim_ids = buffer.get_best_ids()
+        # Initialize the attack buffer (skipped when resuming: the checkpoint replaces it)
+        if resume_checkpoint is None:
+            buffer, flops_init = self.init_buffer(model, attack_ids)
+        else:
+            buffer = AttackBuffer(self.config.buffer_size)
+            flops_init = 0
         assert self.tokenizer is not None, "Shouldn't happen but at least type hints are happy"
         token_selection = SubstitutionSelectionStrategy(
             self.config,
@@ -342,6 +380,9 @@ class GCGAttack(Attack):
             self.not_allowed_ids,
             self.tokenizer
         )
+        if resume_checkpoint is not None:
+            self._apply_resume_state(buffer, token_selection, resume_checkpoint, model.device)
+        optim_ids = buffer.get_best_ids()
         losses = []
         times = []
         flops = []
@@ -374,23 +415,43 @@ class GCGAttack(Attack):
             tokens = prepare_conversation(tokenizer, conversation, attack_conversation)[0]
             token_list.append(torch.cat(tokens[:5]))
             attack_conversations.append(attack_conversation)
-        batch_completions = generate_ragged_batched(
-            model,
-            tokenizer,
-            token_list=token_list,
-            initial_batch_size=len(token_list),
-            max_new_tokens=self.config.generation_config.max_new_tokens,
-            temperature=self.config.generation_config.temperature,
-            top_p=self.config.generation_config.top_p,
-            top_k=self.config.generation_config.top_k,
-            num_return_sequences=self.config.generation_config.num_return_sequences,
-        )  # (N_steps, N_return_sequences, T)
+
+        # Resolve per-step sample counts; slice to actual steps in case of early stopping
+        actual_steps = len(optim_strings)
+        if self.config.generation_config.sampling_schedule is not None:
+            schedule = self.config.generation_config.sampling_schedule[:actual_steps]
+        else:
+            schedule = [self.config.generation_config.num_return_sequences] * actual_steps
+
+        # Group step indices by their non-zero sample count for batched generation
+        groups: dict[int, list[int]] = {}
+        for i, n in enumerate(schedule):
+            if n > 0:
+                groups.setdefault(n, []).append(i)
+
+        completions: list[list[str]] = [[] for _ in range(actual_steps)]
+        for n_seqs, step_indices in groups.items():
+            group_tokens = [token_list[i] for i in step_indices]
+            group_completions = generate_ragged_batched(
+                model,
+                tokenizer,
+                token_list=group_tokens,
+                initial_batch_size=len(group_tokens),
+                max_new_tokens=self.config.generation_config.max_new_tokens,
+                temperature=self.config.generation_config.temperature,
+                top_p=self.config.generation_config.top_p,
+                top_k=self.config.generation_config.top_k,
+                num_return_sequences=n_seqs,
+            )
+            for step_idx, step_completions in zip(step_indices, group_completions):
+                completions[step_idx] = step_completions
+
         steps = []
         t1 = time.time()
-        for i in range(len(optim_strings)):
+        for i in range(actual_steps):
             step = AttackStepResult(
-                step=i,
-                model_completions=batch_completions[i],
+                step=i + step_offset,
+                model_completions=completions[i],
                 time_taken=times[i],
                 loss=losses[i],
                 flops=flops[i],
@@ -399,10 +460,22 @@ class GCGAttack(Attack):
             )
             steps.append(step)
 
+        checkpoint_data = {
+            "buffer": [(loss, ids.detach().cpu()) for loss, ids in buffer.buffer],
+            "grad_buffer": token_selection.grad_buffer.detach().cpu() if token_selection.grad_buffer is not None else None,
+            "target_length": self.target_length,
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "python": random.getstate(),
+            },
+        }
+
         run = SingleAttackRunResult(
             original_prompt=conversation,
-            steps=steps,
-            total_time=t1 - t0,
+            steps=prior_steps + steps,
+            total_time=prior_total_time + (t1 - t0),
+            checkpoint=checkpoint_data,
         )
         return run
 

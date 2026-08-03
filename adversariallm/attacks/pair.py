@@ -205,7 +205,8 @@ class PAIRAttack(Attack):
                         reordered.extend(per_stream_extras[stream_idx])
                 completions[step_idx] = reordered
         steps = []
-        for i in range(self.config.num_steps):
+        n_completed_steps = len(completions)
+        for i in range(n_completed_steps):
             step = AttackStepResult(
                 step=i,
                 model_completions=completions[i],
@@ -383,7 +384,13 @@ class AttackLM:
                 break
 
         if any([output is None for output in valid_outputs]):
-            raise ValueError(f"Failed to generate output after {self.max_attempts} attempts, run again with more attempts or fewer steps.")
+            n_failed = sum(output is None for output in valid_outputs)
+            logging.warning(
+                f"Failed to generate valid output for {n_failed}/{len(valid_outputs)} streams "
+                f"after {self.max_attempts} attempts. Returning None for those streams so the "
+                f"caller can terminate the attack gracefully and keep the steps completed so far, "
+                f"instead of raising and losing them."
+            )
         return valid_outputs, flops
 
 
