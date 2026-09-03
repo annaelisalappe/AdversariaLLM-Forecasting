@@ -5,6 +5,22 @@ The script filters runs based on the filter_by configuration and generates
 completions from scratch using the generation_config, replacing all existing
 completions and removing scores.
 
+Set `keep_existing_samples: true` to instead append the newly generated
+completions/scores to the existing ones for each step (nothing is thrown
+away). Existing and new completions stay index-aligned with their score
+lists.
+
+Set `only_where_sampled: true` to restrict generation to steps that already
+had at least one completion in the original file (e.g. steps hit by a
+sampling_schedule). Steps that originally collected 0 samples are left
+untouched (still 0) instead of being sampled for the first time.
+
+Set `exclude_idx` to drop matched paths for given dataset_params.idx values
+(e.g. a behaviour another concurrent job is already handling), and/or
+`path_offset`/`path_limit` to process a slice of the (sorted, filtered)
+matched paths instead of all of them, e.g. to split one filter_by across
+multiple concurrent jobs without them working on the same runs.
+
 Example:
 
 filter_by:
@@ -26,6 +42,7 @@ from datetime import datetime
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # determinism
 import copy
+import json
 import logging
 import sys
 
@@ -34,9 +51,7 @@ import torch
 from judgezoo import Judge
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
-from vllm import LLM, SamplingParams, TokensPrompt
 
-from adversariallm.dataset import json
 from adversariallm.errors import print_exceptions
 from adversariallm.io_utils import (
     CompactJSONEncoder,
@@ -79,6 +94,7 @@ def generate_ragged_batched_vllm(
     top_p,
     top_k
 ) :
+    from vllm import SamplingParams, TokensPrompt
     sampling_params = SamplingParams(
         n=num_return_sequences,
         temperature=temperature,
@@ -106,15 +122,40 @@ def main(cfg: DictConfig) -> None:
     logging.info(f"Commencing run `{date_time_string}`")
     logging.info("-------------------")
 
+    keep_existing_samples = cfg.get("keep_existing_samples", False)
+    if keep_existing_samples:
+        logging.info("keep_existing_samples=True: appending new completions/scores instead of overwriting")
+    only_where_sampled = cfg.get("only_where_sampled", False)
+    if only_where_sampled:
+        logging.info("only_where_sampled=True: skipping steps that had 0 samples in the original file")
+
     filter_by = OmegaConf.to_container(cfg.filter_by)
     filter_by = eval_list_expressions_in_dict(filter_by)
     print(filter_by)
     # get all paths
-    paths = get_filtered_and_grouped_paths(filter_by, None)[("all", )]
+    paths = sorted(get_filtered_and_grouped_paths(filter_by, None)[("all", )])
     if not paths:
         logging.info("No paths found, exiting")
         return
     logging.info(f"Found {len(paths)} paths")
+
+    exclude_idx = cfg.get("exclude_idx", None)
+    if exclude_idx:
+        exclude_idx = set(exclude_idx)
+        filtered_paths = []
+        for p in paths:
+            with open(p) as f:
+                run_idx = json.load(f)["config"]["dataset_params"]["idx"]
+            if not any(i in exclude_idx for i in run_idx):
+                filtered_paths.append(p)
+        paths = filtered_paths
+        logging.info(f"exclude_idx={sorted(exclude_idx)}: {len(paths)} paths remain")
+
+    path_offset = cfg.get("path_offset", 0)
+    path_limit = cfg.get("path_limit", None)
+    if path_offset or path_limit is not None:
+        paths = paths[path_offset: path_offset + path_limit if path_limit is not None else None]
+        logging.info(f"path_offset={path_offset} path_limit={path_limit}: processing {len(paths)} paths")
 
     n = 0
     pbar = tqdm(paths, file=sys.stdout)
@@ -135,13 +176,16 @@ def main(cfg: DictConfig) -> None:
 
             # Update the attack run config to use the new generation config
             attack_run["config"]["attack_params"]["generation_config"] = new_gen_config
+            defense_params = attack_run["config"].get("defense_params")
             run_config = RunConfig(
                 model=attack_run["config"]["model"],
                 dataset=attack_run["config"]["dataset"],
                 attack=attack_run["config"]["attack"],
+                defense=attack_run["config"].get("defense"),
                 model_params=OmegaConf.structured(attack_run["config"]["model_params"]),
                 dataset_params=OmegaConf.structured(attack_run["config"]["dataset_params"]),
                 attack_params=OmegaConf.structured(attack_run["config"]["attack_params"]),
+                defense_params=OmegaConf.structured(defense_params) if defense_params is not None else None,
             )
 
             run_config = filter_config(run_config, -1)
@@ -158,14 +202,26 @@ def main(cfg: DictConfig) -> None:
 
             # Generate new completions from scratch using the new generation config
             for subrun in attack_run["runs"]:
+                if only_where_sampled:
+                    sampled_steps = [
+                        step for step in subrun["steps"]
+                        if len(step.get("model_completions", [])) > 0
+                    ]
+                else:
+                    sampled_steps = subrun["steps"]
+
                 tokens = []
                 classifiers = set()
-                for step in subrun["steps"]:
+                for step in sampled_steps:
                     tokens.append(torch.tensor(step["model_input_tokens"]))
                     # Check which judges were used in the original file
                     if "scores" in step:
                         classifiers.update(list(step["scores"].keys()))
-                logging.info(f"Generating {len(subrun['steps'])}x{new_gen_config['num_return_sequences']} completions.")
+
+                if not sampled_steps:
+                    logging.info("No sampled steps found (only_where_sampled=True), skipping subrun.")
+                    continue
+                logging.info(f"Generating {len(sampled_steps)}x{new_gen_config['num_return_sequences']} completions (out of {len(subrun['steps'])} steps).")
 
                 new_completions = gen_function[backend](
                     model,
@@ -204,27 +260,28 @@ def main(cfg: DictConfig) -> None:
                     if all(r is None for r in results):
                         continue
                     i = 0
-                    for step in subrun["steps"]:
+                    for step in sampled_steps:
                         # Initialize scores dict if it doesn't exist
                         if "scores" not in step:
                             step["scores"] = {}
                         if classifier not in step["scores"]:
                             step["scores"][classifier] = {}
                         for k, v in results.items():
-                            if k not in step["scores"][classifier]:
-                                step["scores"][classifier][k] = []
-                            step["scores"][classifier][k] = v[i:i+n_to_generate]
+                            existing = step["scores"][classifier].get(k, [])
+                            new_vals = v[i:i+n_to_generate]
+                            step["scores"][classifier][k] = (existing + new_vals) if keep_existing_samples else new_vals
                         i += n_to_generate
                 if len(classifiers) > 1:
                     del judge
                     free_vram()
 
-                # Replace model_completions with new ones
-                for step, completions in zip(subrun["steps"], new_completions):
-                    step["model_completions"] = completions
+                # Replace (or, with keep_existing_samples, extend) model_completions
+                for step, completions in zip(sampled_steps, new_completions):
+                    existing_completions = step.get("model_completions", []) if keep_existing_samples else []
+                    step["model_completions"] = existing_completions + completions
                     n += n_to_generate
 
-                pbar.set_description(f"{len(subrun['steps']) * n_to_generate} | {n} total")
+                pbar.set_description(f"{len(sampled_steps) * n_to_generate} | {n} total")
 
             log_dir = os.path.join(cfg.save_dir, date_time_string)
             i = 0

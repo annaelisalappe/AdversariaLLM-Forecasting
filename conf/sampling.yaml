@@ -15,6 +15,26 @@ hydra:
 name: testing
 save_dir: ${output_root}/outputs/
 
+# If true, newly generated completions/scores are appended to the existing
+# ones in each step instead of replacing them (nothing is thrown away).
+keep_existing_samples: false
+
+# If true, only generate for steps that already had >=1 sample in the
+# original file (e.g. steps hit by a sampling_schedule); steps that
+# originally collected 0 samples are left untouched.
+only_where_sampled: false
+
+# Drop any matched path whose dataset_params.idx intersects this list
+# (e.g. to exclude a behaviour another concurrent job is already handling)
+# before path_offset/path_limit slicing is applied.
+exclude_idx: null
+
+# Slice the (sorted, exclude_idx-filtered) list of matched paths, e.g. to
+# split work for the same filter_by across multiple concurrent jobs
+# without overlap.
+path_offset: 0
+path_limit: null
+
 # What generation config to use for sampling
 generation_config:
   temperature: 0.0
