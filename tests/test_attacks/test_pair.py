@@ -1,5 +1,9 @@
 from types import SimpleNamespace
 
+import json
+from dataclasses import asdict
+
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -98,6 +102,7 @@ def test_pair_num_return_sequences_with_many_streams(monkeypatch):
         seed=0,
         num_steps=1,
         num_streams=4,
+        resume_from=None,
         generation_config=SimpleNamespace(
             max_new_tokens=16,
             temperature=0.0,
@@ -165,3 +170,121 @@ def test_pair_num_return_sequences_with_many_streams(monkeypatch):
         "base-2", "extra-2-0", "extra-2-1",
         "base-3", "extra-3-0", "extra-3-1",
     ]
+
+
+def _resume_setup(monkeypatch, fail_on_call=None):
+    """Mock PAIR's models; get_attack mutates conversations like the real one."""
+    calls = {"n": 0}
+
+    class FakeDefense:
+        class model:
+            name_or_path = "dummy-model"
+
+        tokenizer = None
+
+    def _mock_get_attack(self, convs_list, prompts_list):
+        calls["n"] += 1
+        for conv, prompt in zip(convs_list, prompts_list):
+            conv.append({"role": "user", "content": prompt})
+            conv.append({"role": "assistant", "content": "seed"})
+        if calls["n"] == fail_on_call:
+            return [None for _ in convs_list], 0
+        for i, conv in enumerate(convs_list):
+            conv[-1]["content"] = f"call{calls['n']}-stream{i}"
+        return [{"improvement": "x", "prompt": f"attack-{calls['n']}-{i}"} for i in range(len(convs_list))], 0
+
+    def _mock_get_response(self, conversations):
+        n = len(conversations)
+        return (
+            [f"resp-{calls['n']}-{i}" for i in range(n)],
+            [torch.tensor([i], dtype=torch.long) for i in range(n)],
+            0,
+            None,
+            None,
+        )
+
+    monkeypatch.setattr("adversariallm.attacks.pair.AttackLM.get_attack", _mock_get_attack)
+    monkeypatch.setattr("adversariallm.attacks.pair.TargetLM.get_response", _mock_get_response)
+    monkeypatch.setattr("adversariallm.attacks.pair.JudgeLM.score", lambda self, p, r: ([3 for _ in p], 7))
+    return FakeDefense()
+
+
+def _resume_cfg(num_steps, resume_from=None):
+    return SimpleNamespace(
+        seed=0,
+        num_steps=num_steps,
+        num_streams=2,
+        resume_from=resume_from,
+        generation_config=SimpleNamespace(
+            max_new_tokens=16, temperature=0.0, top_p=1.0, top_k=0, num_return_sequences=1
+        ),
+        attack_model=SimpleNamespace(
+            id="dummy-model", max_attempts=1, max_new_tokens=16, temperature=1.0, top_p=0.9
+        ),
+        target_model=SimpleNamespace(max_new_tokens=16, temperature=0.0, top_p=1.0),
+        judge_model=SimpleNamespace(id=None),
+    )
+
+
+def _save_run_dir(run, path):
+    run_dict = {"steps": [asdict(s) for s in run.steps], "total_time": run.total_time}
+    (path / "run.json").write_text(json.dumps({"runs": [run_dict]}))
+    torch.save(run.checkpoint, path / "checkpoint.pt")
+
+
+CONV = [{"role": "user", "content": "prompt"}, {"role": "assistant", "content": "target"}]
+
+
+def test_pair_resume_continues_from_checkpoint(monkeypatch, tmp_path):
+    defense = _resume_setup(monkeypatch)
+    first = PAIRAttack(_resume_cfg(2)).run(defense, [CONV]).runs[0]
+    assert len(first.steps) == 2
+    ckpt = first.checkpoint
+    assert all(len(conv) == 1 + 2 * 2 for conv in ckpt["convs_list"])
+    assert ckpt["flops_judge"] == 7
+    _save_run_dir(first, tmp_path)
+
+    seen = {}
+    orig_get_attack = None
+
+    defense = _resume_setup(monkeypatch)
+    from adversariallm.attacks import pair as pair_module
+
+    orig_get_attack = pair_module.AttackLM.get_attack
+
+    def _spy(self, convs_list, prompts_list):
+        seen["lens"] = [len(c) for c in convs_list]
+        seen["prompts"] = list(prompts_list)
+        seen["last_assistant"] = [c[-1]["content"] for c in convs_list]
+        return orig_get_attack(self, convs_list, prompts_list)
+
+    monkeypatch.setattr(pair_module.AttackLM, "get_attack", _spy)
+    resumed = PAIRAttack(_resume_cfg(1, resume_from=str(tmp_path))).run(defense, [CONV]).runs[0]
+
+    # Attacker saw the saved history plus the saved processed responses.
+    assert seen["lens"] == [5, 5]
+    assert seen["last_assistant"] == ["call2-stream0", "call2-stream1"]
+    assert seen["prompts"] == ckpt["processed_response_list"]
+    # Prior + new steps, with continuing indices.
+    assert [s.step for s in resumed.steps] == [0, 1, 2]
+    assert resumed.steps[0].model_completions == first.steps[0].model_completions
+    assert all(len(conv) == 1 + 2 * 3 for conv in resumed.checkpoint["convs_list"])
+
+
+def test_pair_checkpoint_drops_dangling_pair_on_early_stop(monkeypatch):
+    defense = _resume_setup(monkeypatch, fail_on_call=2)
+    run = PAIRAttack(_resume_cfg(3)).run(defense, [CONV]).runs[0]
+    assert len(run.steps) == 1
+    # Only the first step completed; the failed step's unanswered pair is removed.
+    assert all(len(conv) == 3 for conv in run.checkpoint["convs_list"])
+    assert all(conv[-1]["content"].startswith("call1-") for conv in run.checkpoint["convs_list"])
+    assert run.checkpoint["processed_response_list"][0].count("resp-1-0") == 1
+
+
+def test_pair_resume_rejects_mismatched_prompt(monkeypatch, tmp_path):
+    defense = _resume_setup(monkeypatch)
+    first = PAIRAttack(_resume_cfg(1)).run(defense, [CONV]).runs[0]
+    _save_run_dir(first, tmp_path)
+    other = [{"role": "user", "content": "different prompt"}, CONV[1]]
+    with pytest.raises(ValueError, match="does not match"):
+        PAIRAttack(_resume_cfg(1, resume_from=str(tmp_path))).run(defense, [other])

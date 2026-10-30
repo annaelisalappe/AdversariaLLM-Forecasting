@@ -343,6 +343,7 @@ pair:
   num_streams: 30
   keep_last_num: 3
   num_steps: 3
+  resume_from: null   # path to a prior run's dir (run.json + checkpoint.pt) to resume from; num_steps = additional steps
   attack_model:
     id: lmsys/vicuna-13b-v1.5
     tokenizer_id: lmsys/vicuna-13b-v1.5

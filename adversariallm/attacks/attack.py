@@ -87,7 +87,7 @@ class SingleAttackRunResult:
 
     # Optimizer-internal state needed to exactly resume this run later (e.g. buffer
     # contents, RNG state). Only populated by attacks that support resuming (currently
-    # GCG). Holds the raw state dict until log_attack() offloads it to a sibling
+    # GCG and PAIR). Holds the raw state dict until log_attack() offloads it to a sibling
     # checkpoint.pt file, after which this holds that file's path instead.
     checkpoint: Optional[Union[dict, str]] = None
 

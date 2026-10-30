@@ -12,7 +12,10 @@ Due to memory limits, we do not use a judge model and just return a score of 1 f
 """
 
 import ast
+import json
 import logging
+import os
+import random
 import re
 import sys
 import time
@@ -79,11 +82,46 @@ class PairConfig:
     attack_model: AttackModelConfig = field(default_factory=AttackModelConfig)
     target_model: TargetModelConfig = field(default_factory=TargetModelConfig)
     judge_model: JudgeModelConfig = field(default_factory=JudgeModelConfig)
+    # Path to a previous run's directory (containing run.json + checkpoint.pt) to
+    # resume from. num_steps additional steps are run on top of the prior ones;
+    # the resulting run.json contains the full (prior + new) step history.
+    resume_from: Optional[str] = None
 
 
 class PAIRAttack(Attack):
     def __init__(self, config):
         super().__init__(config)
+
+    @staticmethod
+    def _load_resume_state(resume_from: str) -> tuple[list[AttackStepResult], float, dict]:
+        """Load a prior run's logged steps and its resume checkpoint (attacker
+        conversations, RNG state, etc.) from `resume_from` (the run_dir containing
+        run.json + checkpoint.pt)."""
+        with open(os.path.join(resume_from, "run.json")) as f:
+            prior_log = json.load(f)
+        prior_run = prior_log["runs"][0]
+        prior_steps = [AttackStepResult(**step) for step in prior_run["steps"]]
+        prior_total_time = prior_run.get("total_time", 0.0)
+        checkpoint = torch.load(os.path.join(resume_from, "checkpoint.pt"), map_location="cpu")
+        return prior_steps, prior_total_time, checkpoint
+
+    def _fingerprint(self, conversation: Conversation) -> dict:
+        return {
+            "num_streams": self.config.num_streams,
+            "attack_model_id": self.config.attack_model.id,
+            "prompt": conversation[0]["content"],
+            "target": conversation[1]["content"],
+        }
+
+    def _check_fingerprint(self, checkpoint: dict, conversation: Conversation) -> None:
+        saved, current = checkpoint["fingerprint"], self._fingerprint(conversation)
+        mismatched = [k for k in current if saved.get(k) != current[k]]
+        if mismatched:
+            raise ValueError(
+                f"Cannot resume PAIR from {self.config.resume_from}: checkpoint does not match "
+                f"the current run for {mismatched}. resume_from applies to every conversation "
+                "in the job, so use one conversation per job."
+            )
 
     def run(
         self,
@@ -128,6 +166,21 @@ class PAIRAttack(Attack):
             for _ in range(self.config.num_streams)
         ]
 
+        prior_steps: list[AttackStepResult] = []
+        prior_total_time = 0.0
+        flops_judge = 0
+        if self.config.resume_from:
+            prior_steps, prior_total_time, checkpoint = self._load_resume_state(self.config.resume_from)
+            self._check_fingerprint(checkpoint, conversation)
+            convs_list = checkpoint["convs_list"]
+            processed_response_list = checkpoint["processed_response_list"]
+            flops_judge = checkpoint["flops_judge"]
+            torch.set_rng_state(checkpoint["rng_state"]["torch"])
+            if checkpoint["rng_state"]["torch_cuda"] is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(checkpoint["rng_state"]["torch_cuda"])
+            random.setstate(checkpoint["rng_state"]["python"])
+        step_offset = len(prior_steps)
+
         attacks: list[Conversation] = []
         completions: list[list[str]] = []
         completions_raw: list[list[str] | None] = []
@@ -135,7 +188,7 @@ class PAIRAttack(Attack):
         times = []
         token_list: list[torch.Tensor] = []
         flops_list: list[int] = []
-        flops_judge = 0
+        stopped_early = False
         # Begin PAIR
         t1 = time.time()
         for _ in trange(self.config.num_steps, file=sys.stdout):
@@ -145,6 +198,7 @@ class PAIRAttack(Attack):
             )
             if any([attack is None for attack in extracted_attack_list]):
                 logging.info("Failed to generate output. Terminating.")
+                stopped_early = True
                 break
             logging.info("Finished getting adversarial prompts.")
 
@@ -208,7 +262,7 @@ class PAIRAttack(Attack):
         n_completed_steps = len(completions)
         for i in range(n_completed_steps):
             step = AttackStepResult(
-                step=i,
+                step=step_offset + i,
                 model_completions=completions[i],
                 model_completions_raw=completions_raw[i],
                 time_taken=times[i],
@@ -219,10 +273,26 @@ class PAIRAttack(Attack):
                 defense_metadata=completion_defense_meta[i],
             )
             steps.append(step)
+        if stopped_early:
+            # get_attack appended an unanswered user + assistant-seed pair to every stream
+            # before failing; drop it so the checkpoint matches the last completed step.
+            convs_list = [conv[:-2] for conv in convs_list]
+        checkpoint_data = {
+            "convs_list": convs_list,
+            "processed_response_list": processed_response_list,
+            "flops_judge": flops_judge,
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "python": random.getstate(),
+            },
+            "fingerprint": self._fingerprint(conversation),
+        }
         run = SingleAttackRunResult(
             original_prompt=conversation,
-            steps=steps,
-            total_time=t1 - t0
+            steps=prior_steps + steps,
+            total_time=prior_total_time + (t1 - t0),
+            checkpoint=checkpoint_data,
         )
         return run
 
