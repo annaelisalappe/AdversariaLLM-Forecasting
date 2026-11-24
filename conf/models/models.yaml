@@ -332,3 +332,19 @@ Qwen/Qwen2.5-0.5B-Instruct:
   dtype: bfloat16
   chat_template: null
   trust_remote_code: True
+# Hybrid model (Gated DeltaNet + full attention, transformers `qwen3_5`): needs transformers 5.x,
+# flash-linear-attention and an H100/H200 (80 GB+; 27B in bf16, never A100). See notes/qwen38_gcg.md.
+# Thinking off: without enable_thinking=false the template adds a "Reasoning effort is set to xhigh"
+# system message to every render. With it, the generation prompt ends in an empty
+# "<think>\n\n</think>\n\n" block, as the official non-thinking mode does.
+Qwen/Qwen3.8-27B:
+  id: Qwen/Qwen3.8-27B
+  tokenizer_id: Qwen/Qwen3.8-27B
+  short_name: Qwen3.8
+  developer_name: Qwen
+  compile: False
+  dtype: bfloat16
+  chat_template: null
+  chat_template_kwargs:
+    enable_thinking: false
+  trust_remote_code: True

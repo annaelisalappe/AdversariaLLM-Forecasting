@@ -12,7 +12,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -163,6 +163,15 @@ def load_model_and_tokenizer(
                 "No system prompt is used. This aligns with the training setup, but is not consistent "
                 "with other llama3 models, which use a more realistic system prompt."
             )
+
+    # Reasoning mode for chat templates (e.g. {"enable_thinking": False}), used by every
+    # template render in lm_utils.tokenization. Unset (None) -> thinking off where the template
+    # has an `enable_thinking` switch, otherwise the template default; see
+    # `lm_utils.tokenization.get_chat_template_kwargs`.
+    chat_template_kwargs = model_params.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, DictConfig):
+        chat_template_kwargs = OmegaConf.to_container(chat_template_kwargs, resolve=True)
+    tokenizer.chat_template_kwargs = chat_template_kwargs
 
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token

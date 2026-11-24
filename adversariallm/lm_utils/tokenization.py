@@ -18,6 +18,29 @@ from transformers import PreTrainedTokenizerBase
 from ..types import Conversation
 
 
+def get_chat_template_kwargs(tokenizer: PreTrainedTokenizerBase) -> dict:
+    """Chat-template kwargs selecting the model's reasoning mode, e.g. ``{"enable_thinking": False}``.
+
+    Configured per model as ``chat_template_kwargs`` in models.yaml; the model loader attaches
+    them to the tokenizer. Unset (None): templates with an ``enable_thinking`` switch default
+    to thinking off, all others use their own default (no kwargs, i.e. unchanged rendering).
+    An explicit ``{}`` means "template default". Returns a copy.
+
+    This matters for Qwen3.8: its template adds a "Reasoning effort is set to xhigh ..." system
+    message to every render unless ``enable_thinking=False`` is passed, also when
+    ``add_generation_prompt=False``.
+    """
+    kwargs = getattr(tokenizer, "chat_template_kwargs", None)
+    if kwargs is not None:
+        return dict(kwargs)
+    template = tokenizer.chat_template
+    if isinstance(template, dict):
+        template = " ".join(map(str, template.values()))
+    if isinstance(template, str) and "enable_thinking" in template:
+        return {"enable_thinking": False}
+    return {}
+
+
 class TokenMergeError(Exception):
     """
     Exception raised when a merge error occurs.
@@ -369,7 +392,7 @@ def _extract_prefix_middle_suffix(vectors: list[torch.Tensor]) -> tuple[torch.Te
 
 def tokenize_chats(chats: list[Conversation], tokenizer) -> list[torch.Tensor]:
     templates = tokenizer.apply_chat_template(
-        chats, tokenize=False, add_generation_prompt=False
+        chats, tokenize=False, add_generation_prompt=False, **get_chat_template_kwargs(tokenizer)
     )
     # Sometimes, the chat template adds the BOS token to the beginning of the template.
     # The tokenizer adds it again later, so we need to remove it to avoid duplication.
