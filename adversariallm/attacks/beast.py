@@ -21,7 +21,7 @@ from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .attack import (Attack, AttackResult, AttackStepResult, GenerationConfig, SingleAttackRunResult)
-from ..lm_utils import (generate_ragged_batched, get_disallowed_ids, get_flops,
+from ..lm_utils import (generate_ragged_batched, get_disallowed_ids, get_flops, prefix_cache_allowed,
                           prepare_conversation, with_max_batchsize)
 from ..types import Conversation
 
@@ -92,7 +92,7 @@ class BEASTAttack(Attack):
             )[0]
 
             # Compute KV cache for prefix tokens
-            if self.config.use_prefix_cache and "gemma" not in model.name_or_path:
+            if prefix_cache_allowed(model, self.config.use_prefix_cache) and "gemma" not in model.name_or_path:
                 self.populate_prefix_cache(model, pre_tokens, prompt_tokens)
                 flops_prefix = get_flops(model, pre_tokens.numel() + prompt_tokens.numel(), 0, "forward")
             else:

@@ -5,6 +5,7 @@ This module provides utilities for processing data in batches with automatic
 batch size adjustment when out-of-memory errors occur.
 """
 
+import logging
 import sys
 from typing import Callable
 
@@ -12,6 +13,23 @@ import torch
 from tqdm import tqdm
 
 from ..io_utils import free_vram
+
+
+# Triton (used by flash-linear-attention's kernels for Qwen3.5/3.8) reports a CUDA OOM as a bare
+# RuntimeError "Triton Error [CUDA]: out of memory", not as torch.cuda.OutOfMemoryError.
+TRITON_OOM_MESSAGE = "Triton Error [CUDA]: out of memory"
+
+
+def _batch_size_limit_reason(exc: RuntimeError) -> str | None:
+    """Why a RuntimeError means "batch too large" (retry with half), or None to re-raise it."""
+    text = str(exc)
+    if TRITON_OOM_MESSAGE in text:
+        return "Triton CUDA OOM"
+    if "canUse32BitIndexMath" in text:
+        # A kernel refusing a tensor beyond 32-bit indexing, e.g. the causal conv1d of Qwen3.5/3.8's
+        # linear-attention layers once batch x 8192 channels x sequence length passes 2**31 elements.
+        return "32-bit index limit"
+    return None
 
 
 def with_max_batchsize(function: Callable, *inputs, initial_batch_size: int | None = None, verbose: bool = False, success_threshold: int = 64):
@@ -90,6 +108,23 @@ def with_max_batchsize(function: Callable, *inputs, initial_batch_size: int | No
                 raise RuntimeError(
                     "OOM even with batch_size=1; cannot generate further."
                 )
+        except RuntimeError as exc:
+            reason = _batch_size_limit_reason(exc)
+            if reason is None:
+                raise
+            prev_batch_size = batch_size
+            batch_size = batch_size // 2
+            successful_batches = 0
+            logging.warning(
+                "with_max_batchsize caught %s at batch_size=%d; retrying with batch_size=%d",
+                reason,
+                prev_batch_size,
+                batch_size,
+            )
+            if pbar is not None:
+                pbar.set_description(f"Running function b={batch_size}")
+            if batch_size < 1:
+                raise RuntimeError(f"{reason} even with batch_size=1; cannot generate further.") from exc
     if pbar is not None:
         pbar.close()
 

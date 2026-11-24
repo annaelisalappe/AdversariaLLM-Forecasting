@@ -33,7 +33,7 @@ from torch import Tensor
 from tqdm import trange
 
 from .attack import Attack, AttackResult, SingleAttackRunResult, AttackStepResult
-from ..lm_utils import filter_suffix, get_disallowed_ids, generate_ragged_batched, prepare_tokens
+from ..lm_utils import filter_suffix, get_disallowed_ids, generate_ragged_batched, prefix_cache_allowed, prepare_tokens
 
 
 
@@ -148,7 +148,7 @@ class GCGRefusalAttack(Attack):
         ]
 
         # Compute the KV Cache for tokens that appear before the optimized tokens
-        if self.config.use_prefix_cache and model.name_or_path != "google/gemma-2-2b-it":
+        if prefix_cache_allowed(model, self.config.use_prefix_cache) and model.name_or_path != "google/gemma-2-2b-it":
             with torch.no_grad():
                 output = model(inputs_embeds=pre_prompt_embeds, use_cache=True)
                 self.prefix_cache = output.past_key_values

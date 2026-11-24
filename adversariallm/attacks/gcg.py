@@ -47,7 +47,7 @@ from transformers import DynamicCache, PreTrainedModel, PreTrainedTokenizerBase
 from .attack import (Attack, AttackResult, AttackStepResult, GenerationConfig,
                      SingleAttackRunResult)
 from ..dataset import PromptDataset
-from ..lm_utils import (TokenMergeError, filter_suffix, generate_ragged_batched,
+from ..lm_utils import (TokenMergeError, filter_suffix, generate_ragged_batched, prefix_cache_allowed,
                         get_disallowed_ids, get_flops, prepare_conversation,
                         with_max_batchsize)
 
@@ -343,8 +343,10 @@ class GCGAttack(Attack):
         pre_prompt_embeds, post_embeds, target_embeds = [
             embedding_layer(ids) for ids in (pre_prompt_ids, post_ids, target_ids)
         ]
-        # Compute the KV Cache for tokens that appear before the optimized tokens
-        if self.config.use_prefix_cache and "gemma" not in model.name_or_path:
+        # Compute the KV Cache for tokens that appear before the optimized tokens.
+        # Not for hybrid linear-attention models (Qwen3.5/3.8): their recurrent state cannot be
+        # cropped back to the prefix, so a reused cache would give wrong candidate losses.
+        if prefix_cache_allowed(model, self.config.use_prefix_cache) and "gemma" not in model.name_or_path:
             with torch.no_grad():
                 self.prefix_cache = DynamicCache()
                 output = model(inputs_embeds=pre_prompt_embeds, past_key_values=self.prefix_cache, use_cache=True)

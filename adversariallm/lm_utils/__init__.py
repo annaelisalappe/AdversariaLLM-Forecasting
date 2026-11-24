@@ -10,7 +10,13 @@ This package provides utilities for language model operations including:
 """
 
 # Core generation functions
-from .generation import generate_ragged, generate_ragged_batched, get_losses_batched
+from .generation import (
+    generate_ragged,
+    generate_ragged_batched,
+    get_losses_batched,
+    is_hybrid_linear_attention_model,
+    prefix_cache_allowed,
+)
 
 # Batch processing utilities
 from .batching import with_max_batchsize
@@ -81,6 +87,8 @@ __all__ = [
     # Generation
     "generate_ragged",
     "generate_ragged_batched",
+    "is_hybrid_linear_attention_model",
+    "prefix_cache_allowed",
     "get_losses_batched",
     # Batching
     "with_max_batchsize",

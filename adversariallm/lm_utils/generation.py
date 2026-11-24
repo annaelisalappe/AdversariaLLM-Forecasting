@@ -10,12 +10,50 @@ from typing import Any, Literal, overload
 
 import torch
 import torch.nn.functional as F
-from transformers import DynamicCache, HybridCache, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import DynamicCache, PreTrainedModel, PreTrainedTokenizerBase
+from transformers.cache_utils import LinearAttentionCacheLayerMixin, StaticCache
+
+try:
+    from transformers.cache_utils import LAYER_TYPE_CACHE_MAPPING
+except ImportError:  # renamed in transformers 5.15
+    from transformers.cache_utils import DYNAMIC_LAYER_TYPE_MAPPING as LAYER_TYPE_CACHE_MAPPING
 
 from .batching import with_max_batchsize
 from .filters import FILTER_REGISTRY, FilterPipeline, NullFilter, validate_json_strings
 from .sampling import top_k_filtering, top_p_filtering
 from .utils import get_stop_token_ids
+
+
+def is_hybrid_linear_attention_model(model: PreTrainedModel) -> bool:
+    """True for models with linear-attention-style layers (e.g. Qwen3.5/3.8's Gated DeltaNet, Mamba).
+
+    Such layers keep a fixed-size conv/recurrent state instead of keys/values (transformers
+    maps their layer types to a `LinearAttentionCacheLayerMixin` cache layer). That state
+    cannot be cropped back to a shorter prefix, so attacks with a reusable prefix cache
+    (GCG & co.) must not use one for these models.
+    """
+    config = model.config.get_text_config(decoder=True)
+    return any(
+        issubclass(LAYER_TYPE_CACHE_MAPPING.get(layer_type, object), LinearAttentionCacheLayerMixin)
+        for layer_type in getattr(config, "layer_types", None) or []
+    )
+
+
+def prefix_cache_allowed(model: PreTrainedModel, requested: bool) -> bool:
+    """Whether an attack may reuse a prefix KV cache across candidates for this model.
+
+    Prefix caching relies on cropping the cache back to the prefix after every forward pass.
+    `crop` is a no-op for linear-attention layers, so their state would silently keep the
+    previous candidate's suffix and the losses would be wrong. Hybrid models therefore run
+    without a prefix cache (correct, only slower).
+    """
+    if requested and is_hybrid_linear_attention_model(model):
+        logging.warning(
+            "Prefix caching disabled: %s has linear-attention layers whose state cannot be cropped.",
+            model.name_or_path,
+        )
+        return False
+    return requested
 
 
 @overload
@@ -394,11 +432,19 @@ def generate_ragged(
                 # but faster if prompts have different lengths and **saves VRAM**.
 
                 # Fill prefix cache
-                if not is_gemma:
+                if is_hybrid_linear_attention_model(model):
+                    # One cache layer per layer type: keys/values for attention layers,
+                    # conv/recurrent state for linear-attention layers. Only for hybrid
+                    # models: built from the config, the cache would also turn on sliding-window
+                    # layers for other models and change their (established) outputs.
+                    past_key_values = DynamicCache(config=model.config)
+                elif not is_gemma:
                     past_key_values = DynamicCache()
                 else:
                     config = model.config if hasattr(model.config, "cache_implementation") else model.config.text_config
-                    past_key_values = HybridCache(
+                    # transformers 5 removed HybridCache; StaticCache builds the sliding-window
+                    # layers from the config.
+                    past_key_values = StaticCache(
                         config=config,
                         max_batch_size=B,
                         max_cache_len=next_token_idx.max().item() + max_new_tokens,
@@ -476,6 +522,10 @@ def generate_ragged(
                             break
 
                         for layer in past_key_values.layers:
+                            if isinstance(layer, LinearAttentionCacheLayerMixin):
+                                # Conv/recurrent state: drop finished rows via the layer's own reorder.
+                                layer.reorder_cache(still_active.nonzero().squeeze(-1))
+                                continue
                             layer.keys = layer.keys[still_active.to(layer.keys.device)].clone()
                             layer.values = layer.values[still_active.to(layer.values.device)].clone()
 
