@@ -207,6 +207,14 @@ Losses per prompt (identify behaviours by text, not by index):
   input and the generation input against the native `tokenizer.apply_chat_template(..., add_generation_prompt=True)`.
   The BOS bug and the Qwen3.8 reasoning system message both rendered fine as text but put the wrong tokens in front
   of the model.
+- **Llama-3.x gets a "You are a helpful assistant" system prompt, in GCG too.** The repo template
+  `chat_templates/chat_templates/llama-3-instruct.jinja:33` always writes it into the system block, after the
+  usual "Cutting Knowledge Date: December 2023 / Today Date: 26 Jul 2024" header. `models.yaml` selects that
+  template for Llama-3.1-8B (`chat_template: llama-3-instruct`), and the model loader installs it, so every attack
+  gets it. The native HF template has the same date header but no default prompt, so our GCG input is 5 tokens
+  longer (87 vs 82 on GuidedBench row 0). `jonas` uses the identical template, so her GCG Llama inputs match ours;
+  both differ from a plain `apply_chat_template` input. On claudini this raised the target loss from 1.92 to 2.11
+  (KL 0.026). A user-given system message is appended straight after it with no separator.
 - **On Qwen3.8, StrongREJECT has a floor, so mean harm can drop while the attack is working.** Qwen's typical step-0
   answer is a refusal plus a safe alternative, and StrongREJECT scores those 0.05-0.79. As the attack moves the model
   off these answers, mean harm can first go down even though the attack is making progress. Our GCG on Qwen showed
