@@ -399,7 +399,8 @@ def tokenize_chats(chats: list[Conversation], tokenizer) -> list[torch.Tensor]:
     if tokenizer.bos_token:
         for i, template in enumerate(templates):
             templates[i] = template.removeprefix(tokenizer.bos_token)
-            if "llama-2" in tokenizer.name_or_path.lower() and tokenizer.eos_token and tokenizer.bos_token:
+            name = tokenizer.name_or_path.lower()
+            if ("llama-2" in name or "llama2" in name) and tokenizer.eos_token and tokenizer.bos_token:
                 # transformers 5: preserve the historical Llama-2 turn boundary tokenization across
                 # tokenizer implementations by keeping an explicit space before [INST]
                 # after internal </s><s> separators.
