@@ -7,6 +7,7 @@ during text generation, including logits filtering and validation.
 
 import copy
 import logging
+import sys
 import threading
 from typing import Any, Iterator, Mapping, Optional, Sequence, Protocol
 from collections import Counter, deque
@@ -19,6 +20,28 @@ from ..types import JsonSchema
 
 # Guard to avoid repeatedly patching the lm-format-enforcer decode hook
 _DECODE_PATCHED = False
+
+
+def _ensure_lmfe_transformers_compat() -> None:
+    """Make `lmformatenforcer.integrations.transformers` importable on transformers >= 5.
+
+    transformers 5 stopped re-exporting `PreTrainedTokenizerBase` from
+    `transformers.tokenization_utils`. lm-format-enforcer (pinned at 0.10.11; 0.11.x has the
+    same import) still imports it from there, inside a bare `except ImportError` that re-raises
+    the misleading 'transformers is not installed'. The result is that every JSON-constrained
+    generation fails while free generation keeps working.
+
+    Re-attach the symbol to whatever object currently lives in `sys.modules`. Resolving it
+    there rather than through a previously imported alias matters: `transformers.tokenization_utils`
+    is a lazy module and the entry can be replaced after first access, which silently discards
+    an attribute set on a stale object.
+    """
+    module = sys.modules.get("transformers.tokenization_utils")
+    if module is None:
+        import transformers.tokenization_utils  # noqa: F401  (populates sys.modules)
+
+        module = sys.modules["transformers.tokenization_utils"]
+    setattr(module, "PreTrainedTokenizerBase", PreTrainedTokenizerBase)
 
 # Lightweight in-memory cache for tokenizer-derived enforcer data
 _TOK_DATA_CACHE: dict[tuple, object] = {}
@@ -296,6 +319,8 @@ class JSONFilter:
         white_list_chars: bool = True,
         **kwargs
     ):
+
+        _ensure_lmfe_transformers_compat()
 
         # ── patch the decode fn just-in-time (once per process) ──────
         global _DECODE_PATCHED

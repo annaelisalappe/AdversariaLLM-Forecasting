@@ -418,6 +418,11 @@ class LocalTextGenerator(TextGenerator):
                     input_ids=[tokens.cpu().squeeze(0).tolist() for tokens in token_list_cache],
                 )
                 break
+            except ImportError:
+                # A missing/incompatible dependency is an environment error, not a bad sample:
+                # retrying cannot fix it, and swallowing it turns a one-line failure into a full
+                # run of empty generations that only surfaces downstream as JSON parse errors.
+                raise
             except Exception as exc:
                 logging.error(
                     "LocalTextGenerator error on attempt %d/%d: %s",
@@ -779,6 +784,11 @@ def safe_generate_with_conv(
         input_ids = res.input_ids or [None] * len(responses)
         raw_gen0 = [row[0] for row in res.raw_gen] if res.raw_gen is not None else [None] * len(responses)
         defense_row0 = [row[0] for row in res.defense_decisions] if res.defense_decisions is not None else [None] * len(responses)
+    except ImportError:
+        # Deliberately not covered by the fallback below: a broken environment affects every
+        # call, so falling back yields a full run of empty generations that looks like a model
+        # failure. Surface it where it happens instead.
+        raise
     except Exception as exc:
         logging.error(f"Error in {context} generation: {exc}. Prompts: {prompts}, filters: {filters}, kwargs: {attempt_kwargs}")
         logging.info("Falling back to empty responses.")
