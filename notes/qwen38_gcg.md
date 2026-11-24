@@ -194,13 +194,37 @@ Losses per prompt (identify behaviours by text, not by index):
   Qwen3-family attacker or judge model added later would be too (set `chat_template_kwargs: {}` to keep the template
   default).
 
+## Lessons from our runs that also apply to GCG
+
+- **Gemma-4 has no `<bos>` on this branch, and that affects every attack, GCG included.** Gemma-4's tokenizer does
+  not add BOS itself, and `tokenize_chats` strips the template's `<bos>`. Without BOS the model produces degenerate
+  text and much higher losses: on claudini the step-0 target loss went from 0.67 with BOS to 5.43 without. All our
+  Gemma-4 runs from before the fix (jonas a843111, 2026-11-22) were invalid, our GCG runs included.
+  - Port that fix before running Gemma-4.
+  - For any new model, check `tokenize_chats(...)[0][0] == bos_token_id` whenever its template emits BOS.
+  - Gemma-2/3 and Llama add BOS themselves and are unaffected.
+- **For any new model, compare the ids token by token with `apply_chat_template`.** Check both the optimisation
+  input and the generation input against the native `tokenizer.apply_chat_template(..., add_generation_prompt=True)`.
+  The BOS bug and the Qwen3.8 reasoning system message both rendered fine as text but put the wrong tokens in front
+  of the model.
+- **On Qwen3.8, StrongREJECT has a floor, so mean harm can drop while the attack is working.** Qwen's typical step-0
+  answer is a refusal plus a safe alternative, and StrongREJECT scores those 0.05-0.79. As the attack moves the model
+  off these answers, mean harm can first go down even though the attack is making progress. Our GCG on Qwen showed
+  early drops on several behaviours before rising. Look at P(SR > 0.5) and the completions themselves, not only at
+  mean SR.
+- **Runs are not reproducible on the GPU, even with the same seed.** Same-seed reruns diverge (deterministic
+  algorithms are on, but H100 and H200 differ, and so do transformers versions). Only spreads across seeds are
+  meaningful, never single-run comparisons.
+- **We sample at T=1, top_p=1, top_k=0, not the model-card settings.** Qwen's card recommends different values. Keep
+  ours if you want to compare with our runs.
+
 ## Available on `jonas` but deliberately not ported
 - Full `reasoning` config block (`lm_utils/reasoning.py`: reasoning/answer split, `model_completions_raw`,
   reasoning token budgets). Not needed with thinking off; here `chat_template_kwargs` does the same for Qwen3.8.
 - `prepare_conversation` rewrite that cuts every part from the generation prompt (`add_generation_prompt=True`).
   For Qwen3.8 single-turn GCG it gives exactly the same tokens as this branch (checked against the reference runs).
   It matters for Gemma-4, gpt-oss and other reasoning models, and changes their behaviour, so it was left out.
-- `tokenize_chats` Gemma-4 BOS fix: Qwen has no BOS, irrelevant here. Needed if you add Gemma-4.
+- `tokenize_chats` Gemma-4 BOS fix (a843111): Qwen has no BOS, so it is irrelevant for Qwen. **Required before any Gemma-4 run with any attack** (see "Lessons" above).
 - Muse-Glimmer `embed_norm` in GCG, claudini 0.0.4-0.0.7 fixes (generate from ids, round-trip filter, Gemma
   `embed_scale`), PAIR changes and perf knobs (`hybrid_left_pad_prefill`, fla recurrent decode), Helmholtz/B300
   deployment, sticky batch-size memo, shared-cache lock fallback in the model loader.
